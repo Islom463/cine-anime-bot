@@ -1,20 +1,18 @@
 """
-Anime / Kino boti: videolar o'zida saqlanadi (file_id bazada), foydalanuvchi havola orqali yoki qidirib topadi.
+@ControllerBot nusxasi (faqat o'zbekcha): kanalga post tayyorlash va yuborish.
 
-Admin (siz) botga video yuborasiz -> bot saqlaydi -> havola beradi: https://t.me/BOT?start=t12
-Foydalanuvchi havolani bossa, anime kartasi va qismlar tugmalari chiqadi.
+Imkoniyatlar:
+  • Kanal qo'shish (bot va siz admin bo'lishingiz kerak)
+  • Post yaratish: matn, rasm, video, GIF, fayl, audio, ovozli xabar...
+  • URL tugmalar (bir qatorda bir nechta), reaksiya tugmalari (sanagich bilan)
+  • Ovozsiz yuborish, ko'rib chiqish, hozir yuborish yoki rejalashtirish
+  • Rejalashtirilgan postlar ro'yxati, statistika
 
-Render Environment:
-  BOT_TOKEN          - majburiy
-  ADMIN_ID           - sizning Telegram ID'ingiz (botda /myid yozing). Bir nechta bo'lsa vergul bilan
-  REQUIRED_CHANNELS  - ixtiyoriy majburiy obuna: @kanal1,@kanal2 (bot kanalda admin bo'lishi kerak)
-  PROTECT_CONTENT    - ixtiyoriy: 1 bo'lsa videoni forward/saqlash taqiqlanadi
-  DB_PATH            - ixtiyoriy (Persistent Disk bo'lsa: /var/data/anime.db)
-  BACKUP_MINUTES     - ixtiyoriy: avtomatik zaxira oralig'i (daqiqa), standart 30
-  POST_CHANNELS      - ixtiyoriy: postlar yuboriladigan kanallar: @kanal1,@kanal2 (bot kanalda admin bo'lishi kerak)
+Render Environment:  BOT_TOKEN (majburiy), ADMIN_ID (ixtiyoriy, /backup uchun), TZ_OFFSET_HOURS (standart 5), DB_PATH
 """
 import os
 import re
+import json
 import html
 import hashlib
 import time
@@ -26,48 +24,31 @@ import tempfile
 import threading
 import urllib.request
 from contextlib import closing
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
-from aiogram.filters import Command, CommandObject, StateFilter
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramUnauthorizedError, TelegramRetryAfter, TelegramBadRequest
-from aiogram.types import (InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton,
-                           FSInputFile, InputMediaDocument, ErrorEvent)
+from aiogram.exceptions import TelegramUnauthorizedError
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, FSInputFile, InputMediaDocument
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logging.basicConfig(level=logging.INFO)
 BOT_STATUS = {"text": "Bot ishga tushmoqda..."}
 
-DB_PATH = os.getenv("DB_PATH", "anime.db")
-_db_dir = os.path.dirname(os.path.abspath(DB_PATH))
-os.makedirs(_db_dir, exist_ok=True)
-
+DB_PATH = os.getenv("DB_PATH", "controller.db")
 ADMIN_IDS = {int(x) for x in re.findall(r"\d+", os.getenv("ADMIN_ID", "") + " " + os.getenv("ADMIN_IDS", ""))}
-REQUIRED = [c.strip() for c in re.split(r"[,\s]+", os.getenv("REQUIRED_CHANNELS", "")) if c.strip()]
-REQUIRED = [c if c.startswith("@") or c.startswith("-100") else "@" + c for c in REQUIRED]
-PROTECT = os.getenv("PROTECT_CONTENT", "0") == "1"
-POST_CHANNELS = [c.strip() for c in re.split(r"[,\s]+", os.getenv("POST_CHANNELS", "")) if c.strip()]
-POST_CHANNELS = [c if c.startswith("@") or c.startswith("-100") else "@" + c for c in POST_CHANNELS]
 try:
     BACKUP_MINUTES = float(os.getenv("BACKUP_MINUTES", "30"))
 except ValueError:
     BACKUP_MINUTES = 30.0
-PAGE = 10
-EP_PAGE = 40
-
-# Fon vazifalari garbage collector tomonidan o'chib ketmasligi uchun ularni saqlab turamiz
-_BG_TASKS = set()
-
-
-def run_bg(coro):
-    t = asyncio.create_task(coro)
-    _BG_TASKS.add(t)
-    t.add_done_callback(_BG_TASKS.discard)
-    return t
+try:
+    TZ = timezone(timedelta(hours=float(os.getenv("TZ_OFFSET_HOURS", "5"))))
+except ValueError:
+    TZ = timezone(timedelta(hours=5))
 
 
 # ---------------- Render uchun veb-server va keep-alive ----------------
@@ -77,21 +58,24 @@ async def _root_handler(request):
 
 async def start_web_server():
     app = web.Application()
-    app.add_routes([web.get("/", _root_handler), web.get("/ping", _root_handler)])
+    app.router.add_get("/", _root_handler)
+    app.router.add_get("/ping", _root_handler)
     runner = web.AppRunner(app)
     await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", 8080))).start()
-    logging.info("Veb-server ishga tushdi (port %s)", os.getenv("PORT", 8080))
+    await web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", 10000))).start()
 
 
 def self_ping():
     while True:
         time.sleep(240)
         try:
-            url = os.getenv("RENDER_EXTERNAL_URL") or f"http://127.0.0.1:{os.environ.get('PORT', 8080)}"
+            url = os.getenv("RENDER_EXTERNAL_URL") or f"http://127.0.0.1:{os.environ.get('PORT', 10000)}"
             urllib.request.urlopen(url, timeout=20).read()
         except Exception:
             pass
+
+
+threading.Thread(target=self_ping, daemon=True).start()
 
 
 def detect_token():
@@ -116,7 +100,6 @@ if not TOKEN:
 
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
-
 
 # ---------------- Token / ulanish diagnostikasi ----------------
 class _StatusLogHandler(logging.Handler):
@@ -159,21 +142,26 @@ async def wait_for_valid_token():
         await asyncio.sleep(60)
 
 
+
 # ---------------- Baza ----------------
 def db():
-    return closing(sqlite3.connect(DB_PATH, timeout=30))
+    return closing(sqlite3.connect(DB_PATH))
 
 
 def init_db():
     with db() as c:
         c.executescript("""
         CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, name TEXT, joined TEXT);
-        CREATE TABLE IF NOT EXISTS titles (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, category TEXT, name TEXT, description TEXT, poster TEXT,
-            views INTEGER DEFAULT 0, created TEXT);
-        CREATE TABLE IF NOT EXISTS episodes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, title_id INTEGER, ep_no INTEGER, file_id TEXT, ftype TEXT);
-        CREATE INDEX IF NOT EXISTS idx_ep_title ON episodes (title_id, ep_no);
+        CREATE TABLE IF NOT EXISTS channels (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER, chat_id INTEGER, title TEXT, username TEXT,
+            UNIQUE(owner_id, chat_id));
+        CREATE TABLE IF NOT EXISTS posts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER, chat_id INTEGER, message_id INTEGER,
+            rows_json TEXT, reacts_json TEXT, created TEXT);
+        CREATE TABLE IF NOT EXISTS votes (post_id INTEGER, user_id INTEGER, idx INTEGER, PRIMARY KEY (post_id, user_id));
+        CREATE TABLE IF NOT EXISTS scheduled (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER, chat_id INTEGER, channel_title TEXT,
+            src_chat INTEGER, src_msg INTEGER, rows_json TEXT, reacts_json TEXT, silent INTEGER, run_at TEXT);
         """)
         c.commit()
 
@@ -181,714 +169,662 @@ def init_db():
 init_db()
 
 
+def utc_str(dt):
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def local_now():
+    return datetime.now(TZ)
+
+
+def add_user(user):
+    with db() as c:
+        c.execute("INSERT OR IGNORE INTO users (user_id, name, joined) VALUES (?, ?, ?)",
+                  (user.id, user.full_name, utc_str(datetime.now(timezone.utc))))
+        c.commit()
+
+
+def get_channels(owner_id):
+    with db() as c:
+        return c.execute("SELECT id, chat_id, title, username FROM channels WHERE owner_id = ? ORDER BY id", (owner_id,)).fetchall()
+
+
+def get_channel(owner_id, cid):
+    with db() as c:
+        return c.execute("SELECT id, chat_id, title, username FROM channels WHERE owner_id = ? AND id = ?", (owner_id, cid)).fetchone()
+
+
 def e(s):
     return html.escape(str(s), quote=False)
 
 
-def is_admin(user_id):
-    return user_id in ADMIN_IDS
+# ---------------- Tugmalar va parserlar ----------------
+URL_PAT = r"(?:https?://|tg://)\S+|(?:t\.me|telegram\.me)/\S+|@\w{4,}"
 
 
-def add_user(user):
-    if not user:
-        return
-    with db() as c:
-        c.execute("INSERT OR IGNORE INTO users (user_id, name, joined) VALUES (?, ?, ?)",
-                  (user.id, user.full_name, datetime.now().strftime("%Y-%m-%d %H:%M")))
-        c.commit()
+def normalize_url(u):
+    u = u.strip()
+    if u.startswith("@"):
+        return "https://t.me/" + u[1:]
+    if re.match(r"^(t\.me|telegram\.me)/", u):
+        return "https://" + u
+    return u
 
 
-def get_title(tid):
-    with db() as c:
-        return c.execute("SELECT id, category, name, description, poster, views FROM titles WHERE id = ?", (tid,)).fetchone()
+def parse_buttons(text):
+    """Har qator = bitta qator. Bir qatorda bir nechta tugma: «|» bilan. Format: Matn - havola"""
+    rows, errors = [], []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        row = []
+        for part in line.split("|"):
+            part = part.strip()
+            m = re.match(r"^(.+?)\s*[-–—]\s*(" + URL_PAT + r")$", part)
+            if not m:
+                errors.append(part)
+                continue
+            row.append([m.group(1).strip()[:64], normalize_url(m.group(2))])
+        if row:
+            rows.append(row[:4])
+    return rows[:20], errors
 
 
-def get_episodes(tid):
-    with db() as c:
-        return c.execute("SELECT id, ep_no, file_id, ftype FROM episodes WHERE title_id = ? ORDER BY ep_no, id", (tid,)).fetchall()
+def parse_reacts(text):
+    items = [t for t in text.split() if t and len(t) <= 10]
+    seen, out = set(), []
+    for t in items:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out[:6]
 
 
-def get_episode(eid):
-    with db() as c:
-        return c.execute("SELECT id, title_id, ep_no, file_id, ftype FROM episodes WHERE id = ?", (eid,)).fetchone()
-
-
-def add_episode(tid, file_id, ftype):
-    with db() as c:
-        n = c.execute("SELECT COALESCE(MAX(ep_no), 0) + 1 FROM episodes WHERE title_id = ?", (tid,)).fetchone()[0]
-        c.execute("INSERT INTO episodes (title_id, ep_no, file_id, ftype) VALUES (?, ?, ?, ?)", (tid, n, file_id, ftype))
-        c.commit()
-    return n
-
-
-def to_int(s, default=0):
+def parse_when(text, now):
+    """now: tz-aware. Natija: tz-aware datetime yoki None."""
+    t = text.strip().lower()
     try:
-        return int(s)
-    except (TypeError, ValueError):
-        return default
+        m = re.fullmatch(r"(bugun|ertaga|indinga)?\s*(\d{1,2})[:.](\d{2})", t)
+        if m:
+            h, mi = int(m.group(2)), int(m.group(3))
+            base = now.replace(hour=h, minute=mi, second=0, microsecond=0)
+            if m.group(1) == "ertaga":
+                base += timedelta(days=1)
+            elif m.group(1) == "indinga":
+                base += timedelta(days=2)
+            elif m.group(1) is None and base <= now:
+                base += timedelta(days=1)
+            return base if base > now else None
+        m = re.fullmatch(r"(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?\s+(\d{1,2})[:.](\d{2})", t)
+        if m:
+            d, mo, y, h, mi = int(m.group(1)), int(m.group(2)), m.group(3), int(m.group(4)), int(m.group(5))
+            y = now.year if not y else (int(y) + 2000 if len(y) == 2 else int(y))
+            dt = datetime(y, mo, d, h, mi, tzinfo=now.tzinfo)
+            if not m.group(3) and dt <= now:
+                dt = dt.replace(year=y + 1)
+            return dt if dt > now else None
+        m = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})\s+(\d{1,2})[:.](\d{2})", t)
+        if m:
+            dt = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4)), int(m.group(5)), tzinfo=now.tzinfo)
+            return dt if dt > now else None
+    except ValueError:
+        return None
+    return None
 
 
-def btn(text, data=None, url=None):
-    return InlineKeyboardButton(text=text, callback_data=data) if data else InlineKeyboardButton(text=text, url=url)
+def btn(text, data):
+    return InlineKeyboardButton(text=text, callback_data=data)
 
 
-MENU = {"🎌 Animelar": "anime", "🎬 Kinolar": "kino", "🔥 Mashhur": "pop", "🔎 Qidirish": "search"}
+def post_kb(rows, reacts, counts=None, post_id=None):
+    kb = [[InlineKeyboardButton(text=t, url=u) for t, u in row] for row in rows]
+    if reacts:
+        line = []
+        for i, em in enumerate(reacts):
+            n = counts[i] if counts else 0
+            line.append(InlineKeyboardButton(text=f"{em} {n}" if n else em, callback_data=f"r:{post_id}:{i}" if post_id else "noop"))
+        kb.append(line)
+    return InlineKeyboardMarkup(inline_keyboard=kb) if kb else None
+
+
+MENU_ITEMS = {
+    "📝 Post yaratish": "new", "📢 Kanallarim": "channels", "⏰ Rejalashtirilgan": "scheduled",
+    "📊 Statistika": "stats", "❓ Yordam": "help",
+}
 
 
 def menu_kb():
     return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="🎌 Animelar"), KeyboardButton(text="🎬 Kinolar")],
-        [KeyboardButton(text="🔥 Mashhur"), KeyboardButton(text="🔎 Qidirish")],
+        [KeyboardButton(text="📝 Post yaratish")],
+        [KeyboardButton(text="📢 Kanallarim"), KeyboardButton(text="⏰ Rejalashtirilgan")],
+        [KeyboardButton(text="📊 Statistika"), KeyboardButton(text="❓ Yordam")],
     ], resize_keyboard=True)
 
 
-async def bot_username():
-    return (await bot.me()).username
+def editor_kb(d):
+    silent = d.get("silent")
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [btn("🔗 URL tugmalar", "ed:urls"), btn("😀 Reaksiyalar", "ed:reacts")],
+        [btn("🧹 Tugmalarni tozalash", "ed:clear"), btn("🔕 Ovozsiz: ha" if silent else "🔔 Ovozsiz: yo'q", "ed:silent")],
+        [btn("📤 Hozir yuborish", "ed:send"), btn("⏰ Rejalashtirish", "ed:sched")],
+        [btn("❌ Bekor qilish", "ed:cancel")],
+    ])
 
 
-# ---------------- Xatolarni ushlash (bot yiqilib qolmasligi uchun) ----------------
-@dp.errors()
-async def on_error(event: ErrorEvent):
-    logging.exception("Handler xatosi: %s", event.exception, exc_info=event.exception)
-    return True
+REACT_PRESETS = ["👍 ❤️ 🔥", "👍 👎", "😂 😮 😢", "❤️ 🔥 👏 🎉", "🤩 😍 🥰"]
+
+HELP = (
+    "❓ <b>Yordam</b>\n\n"
+    "1️⃣ <b>📢 Kanallarim</b> → kanal qo'shing (botni kanalga admin qiling).\n"
+    "2️⃣ <b>📝 Post yaratish</b> → postni yuboring (matn, rasm, video, fayl...).\n"
+    "3️⃣ Tugma yoki reaksiya qo'shing, keyin <b>Hozir yuborish</b> yoki <b>Rejalashtirish</b>.\n\n"
+    "🔗 <b>URL tugma formati</b> (har qator = bir qator tugma):\n"
+    "<code>Kanalga o'tish - https://t.me/kanal</code>\n"
+    "<code>Sayt - https://site.uz | Aloqa - @username</code>\n"
+    "(bir qatorda bir nechta tugma «|» bilan)\n\n"
+    "⏰ <b>Vaqt formati</b>: <code>18:30</code>, <code>ertaga 09:00</code>, <code>25.12 20:00</code>, <code>2026-12-25 20:00</code>\n"
+    f"Vaqt zonasi: UTC{TZ.utcoffset(None).total_seconds() / 3600:+.0f}\n\n"
+    "⚠️ Rejalashtirilgan post yuborilishi uchun asl xabarni botdan o'chirib yubormang."
+)
 
 
-# ---------------- Majburiy obuna ----------------
-async def missing_channels(user_id):
-    missing = []
-    for ch in REQUIRED:
+class S(StatesGroup):
+    content = State()
+    editor = State()
+    urls = State()
+    reacts = State()
+    when = State()
+    channel = State()
+
+
+def not_menu(m):
+    t = m.text
+    return not (t and (t in MENU_ITEMS or t.startswith("/")))
+
+
+def text_not_menu(m):
+    return bool(m.text) and not_menu(m)
+
+
+# ---------------- Yordamchi: editor ----------------
+async def safe_delete(chat_id, message_id):
+    if message_id:
         try:
-            m = await bot.get_chat_member(ch, user_id)
-            if m.status in ("left", "kicked"):
-                missing.append(ch)
-        except Exception as ex:
-            logging.warning("obuna tekshirib bo'lmadi (%s): %s — bot kanalda admin ekanini tekshiring", ch, ex)
-    return missing
+            await bot.delete_message(chat_id, message_id)
+        except Exception:
+            pass
 
 
-async def gate(chat_id, user_id, payload=""):
-    """True — o'tish mumkin. False — obuna xabari yuborildi."""
-    if not REQUIRED or is_admin(user_id):
-        return True
-    missing = await missing_channels(user_id)
-    if not missing:
-        return True
-    kb = [[btn(f"📢 {ch}", url=f"https://t.me/{ch.lstrip('@')}")] for ch in missing if ch.startswith("@")]
-    kb.append([btn("✅ Tekshirish", f"chk:{payload}")])
-    await bot.send_message(chat_id, "❗ Botdan foydalanish uchun quyidagi kanallarga obuna bo'ling:",
-                           reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
-    return False
-
-
-# ---------------- Foydalanuvchi qismi ----------------
-@dp.message(Command("myid"))
-async def cmd_myid(message: types.Message):
-    await message.answer(f"🆔 Sizning ID: <code>{message.from_user.id}</code>")
-
-
-async def open_payload(chat_id, user_id, payload):
-    m = re.fullmatch(r"([te]?)(\d+)", payload or "")
-    if not m:
-        return await bot.send_message(chat_id, "❌ Havola noto'g'ri.", reply_markup=menu_kb())
-    kind, num = m.group(1), int(m.group(2))
-    if kind == "e":
-        return await send_episode(chat_id, num)
-    await show_title(chat_id, num)
-
-
-@dp.message(Command("start"))
-async def cmd_start(message: types.Message, command: CommandObject, state: FSMContext):
-    await state.clear()
-    restore_wait.discard(message.from_user.id)
-    add_user(message.from_user)
-    payload = (command.args or "").strip()[:20]
-    if not await gate(message.chat.id, message.from_user.id, payload):
-        return
-    if payload:
-        return await open_payload(message.chat.id, message.from_user.id, payload)
-    await message.answer(
-        "👋 Salom! Bu yerda anime va kinolarni topishingiz mumkin.\n\n"
-        "🔎 Nomini yozing yoki pastdagi tugmalardan foydalaning.", reply_markup=menu_kb())
-
-
-@dp.callback_query(F.data.startswith("chk:"))
-async def cb_check(callback: types.CallbackQuery):
-    payload = callback.data.split(":", 1)[1]
-    if await missing_channels(callback.from_user.id):
-        return await callback.answer("Hali hamma kanallarga obuna bo'lmadingiz ❌", show_alert=True)
-    await callback.answer("✅ Rahmat!")
+async def show_editor(chat_id, state, note=None):
+    data = await state.get_data()
+    d = data.get("draft")
+    if not d:
+        return await bot.send_message(chat_id, "⚠️ Qoralama topilmadi. «📝 Post yaratish» ni bosing.")
+    await safe_delete(chat_id, d.get("preview_id"))
+    await safe_delete(chat_id, d.get("panel_id"))
+    kb = post_kb(d["rows"], d["reacts"])
     try:
-        await callback.message.delete()
+        prev = await bot.copy_message(chat_id=chat_id, from_chat_id=d["src_chat"], message_id=d["src_msg"], reply_markup=kb)
+    except Exception as ex:
+        logging.warning("preview xatosi: %s", ex)
+        d["rows"] = []
+        await state.update_data(draft=d)
+        await bot.send_message(chat_id, f"❌ Tugmalarda xatolik (havola noto'g'ri bo'lishi mumkin): <code>{e(str(ex)[:150])}</code>\nTugmalar tozalandi.")
+        prev = await bot.copy_message(chat_id=chat_id, from_chat_id=d["src_chat"], message_id=d["src_msg"])
+    info = f"🛠 <b>Post tahrirlagichi</b>\n🔗 Tugmalar: {sum(len(r) for r in d['rows'])} ta · 😀 Reaksiyalar: {' '.join(d['reacts']) or '—'}"
+    if note:
+        info = note + "\n" + info
+    panel = await bot.send_message(chat_id, info, reply_markup=editor_kb(d))
+    d["preview_id"], d["panel_id"] = prev.message_id, panel.message_id
+    await state.update_data(draft=d)
+    await state.set_state(S.editor)
+
+
+async def get_draft(state):
+    return (await state.get_data()).get("draft")
+
+
+# ---------------- Yuborish ----------------
+async def publish_post(owner_id, chat_id, src_chat, src_msg, rows, reacts, silent):
+    with db() as c:
+        cur = c.execute("INSERT INTO posts (owner_id, chat_id, rows_json, reacts_json, created) VALUES (?, ?, ?, ?, ?)",
+                        (owner_id, chat_id, json.dumps(rows), json.dumps(reacts), utc_str(datetime.now(timezone.utc))))
+        post_id = cur.lastrowid
+        c.commit()
+    try:
+        kb = post_kb(rows, reacts, [0] * len(reacts) if reacts else None, post_id)
+        res = await bot.copy_message(chat_id=chat_id, from_chat_id=src_chat, message_id=src_msg, reply_markup=kb, disable_notification=bool(silent))
     except Exception:
-        pass
-    if payload:
-        await open_payload(callback.message.chat.id, callback.from_user.id, payload)
-    else:
-        await bot.send_message(callback.message.chat.id, "✅ Endi foydalanishingiz mumkin!", reply_markup=menu_kb())
+        with db() as c:
+            c.execute("DELETE FROM posts WHERE id = ?", (post_id,))
+            c.commit()
+        raise
+    with db() as c:
+        c.execute("UPDATE posts SET message_id = ? WHERE id = ?", (res.message_id, post_id))
+        c.commit()
+    return res.message_id
+
+
+def explain(ex):
+    s = str(ex).lower()
+    if "not enough rights" in s or "have no rights" in s or "administrator" in s or "forbidden" in s:
+        return "Botda kanalga post yuborish huquqi yo'q (admin qiling)."
+    if "chat not found" in s:
+        return "Kanal topilmadi."
+    if "button_url_invalid" in s or "url host is empty" in s:
+        return "Tugma havolasi noto'g'ri."
+    return str(ex)[:150]
+
+
+# ---------------- Handlerlar: boshlash va menyu ----------------
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message, state: FSMContext):
+    await state.clear()
+    add_user(message.from_user)
+    await message.answer(
+        "👋 Salom! Men kanalingiz uchun postlar tayyorlayman: tugmalar, reaksiyalar, rejalashtirish.\n\n"
+        "Boshlash uchun avval <b>📢 Kanallarim</b> orqali kanal qo'shing.", reply_markup=menu_kb())
 
 
 @dp.message(Command("cancel"))
 async def cmd_cancel(message: types.Message, state: FSMContext):
     await state.clear()
-    restore_wait.discard(message.from_user.id)
     await message.answer("✅ Bekor qilindi.", reply_markup=menu_kb())
 
 
-@dp.message(F.text.in_(set(MENU)))
+@dp.message(Command("help"))
+async def cmd_help(message: types.Message):
+    await message.answer(HELP)
+
+
+@dp.message(F.text.in_(set(MENU_ITEMS)))
 async def on_menu(message: types.Message, state: FSMContext):
     await state.clear()
     add_user(message.from_user)
-    if not await gate(message.chat.id, message.from_user.id):
-        return
-    act = MENU[message.text]
-    if act == "search":
-        return await message.answer("🔎 Anime yoki kino nomini yozing:")
-    await send_list(message.chat.id, act, 0)
+    act = MENU_ITEMS[message.text]
+    if act == "new":
+        await state.set_state(S.content)
+        return await message.answer("📝 Kanalga yuboriladigan postni yuboring: matn, rasm, video, GIF, fayl, audio...\n(Bitta xabar. Albom qo'llab-quvvatlanmaydi.)\n\nBekor qilish: /cancel")
+    if act == "channels":
+        return await show_channels(message)
+    if act == "scheduled":
+        return await show_scheduled(message)
+    if act == "stats":
+        return await show_stats(message)
+    await message.answer(HELP)
 
 
-def list_query(kind):
-    if kind == "pop":
-        return "SELECT id, name, category FROM titles ORDER BY views DESC, id DESC", ()
-    return "SELECT id, name, category FROM titles WHERE category = ? ORDER BY id DESC", (kind,)
+# ---------------- Kanallar ----------------
+async def show_channels(message):
+    rows = get_channels(message.from_user.id)
+    kb = [[btn(f"❌ {t[:30]}", f"chdel:{cid}")] for cid, _, t, _ in rows]
+    kb.append([btn("➕ Kanal qo'shish", "chadd")])
+    text = "📢 <b>Kanallaringiz:</b>\n" + ("\n".join(f"• {e(t)}" + (f" (@{e(u)})" if u else "") for _, _, t, u in rows) if rows else "Hali kanal yo'q.")
+    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
 
-async def send_list(chat_id, kind, page, edit_message=None):
-    q, args = list_query(kind)
-    with db() as c:
-        rows = c.execute(q, args).fetchall()
-    total = len(rows)
-    if not total:
-        text = "😕 Hozircha hech narsa yo'q."
-        if edit_message:
-            try:
-                return await edit_message.edit_text(text)
-            except TelegramBadRequest:
-                return
-        return await bot.send_message(chat_id, text)
-    pages = (total - 1) // PAGE + 1
-    page = max(0, min(page, pages - 1))
-    chunk = rows[page * PAGE:(page + 1) * PAGE]
-    icon = {"anime": "🎌", "kino": "🎬"}
-    kb = [[btn(f"{icon.get(cat, '🎞')} {name[:40]}", f"t:{tid}")] for tid, name, cat in chunk]
-    nav = []
-    if page > 0:
-        nav.append(btn("⬅️", f"list:{kind}:{page - 1}"))
-    nav.append(btn(f"{page + 1}/{pages}", "noop"))
-    if page < pages - 1:
-        nav.append(btn("➡️", f"list:{kind}:{page + 1}"))
-    kb.append(nav)
-    title = {"anime": "🎌 Animelar", "kino": "🎬 Kinolar", "pop": "🔥 Mashhurlar"}[kind]
-    text, markup = f"{title} ({total} ta):", InlineKeyboardMarkup(inline_keyboard=kb)
-    if edit_message:
-        try:
-            return await edit_message.edit_text(text, reply_markup=markup)
-        except TelegramBadRequest:
-            return
-    await bot.send_message(chat_id, text, reply_markup=markup)
-
-
-@dp.callback_query(F.data.startswith("list:"))
-async def cb_list(callback: types.CallbackQuery):
+@dp.callback_query(F.data == "chadd")
+async def cb_chadd(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
-    parts = callback.data.split(":")
-    if len(parts) == 3 and parts[1] in ("anime", "kino", "pop"):
-        await send_list(callback.message.chat.id, parts[1], to_int(parts[2]), edit_message=callback.message)
+    await state.set_state(S.channel)
+    me = await bot.me()
+    await callback.message.answer(
+        f"➕ <b>Kanal qo'shish</b>\n\n1) @{e(me.username)} ni kanalingizga <b>admin</b> qiling (post yuborish huquqi bilan).\n"
+        "2) Kanaldan istalgan xabarni shu yerga <b>forward</b> qiling yoki kanal <b>@username</b> ini yuboring.\n\nBekor qilish: /cancel")
+
+
+async def resolve_channel(message):
+    chat = None
+    origin = getattr(message, "forward_origin", None)
+    if origin is not None:
+        chat = getattr(origin, "chat", None) or getattr(origin, "sender_chat", None)
+    if chat is None:
+        chat = getattr(message, "forward_from_chat", None)
+    if chat is None and message.text:
+        ref = message.text.strip()
+        m = re.search(r"(?:t\.me|telegram\.me)/([A-Za-z0-9_]{4,})", ref)
+        if m:
+            ref = "@" + m.group(1)
+        elif re.fullmatch(r"-?\d{5,}", ref):
+            ref = int(ref)
+        elif not ref.startswith("@"):
+            raise ValueError("Kanaldan xabar forward qiling yoki @username yuboring.")
+        try:
+            chat = await bot.get_chat(ref)
+        except Exception:
+            raise ValueError("Kanal topilmadi. @username to'g'riligini tekshiring.")
+    if chat is None:
+        raise ValueError("Kanaldan xabar forward qiling yoki @username yuboring.")
+    if getattr(chat, "type", "") not in ("channel", "supergroup", "group"):
+        raise ValueError("Bu kanal yoki guruh emas.")
+    me = await bot.me()
+    try:
+        member = await bot.get_chat_member(chat.id, me.id)
+    except Exception:
+        raise ValueError("Bot bu kanalda topilmadi. Avval botni admin qiling.")
+    if member.status not in ("administrator", "creator"):
+        raise ValueError("Bot kanalda admin emas. Avval botni admin qiling.")
+    if getattr(chat, "type", "") == "channel" and getattr(member, "can_post_messages", True) is False:
+        raise ValueError("Botda post yuborish huquqi yo'q. Admin huquqlarida «Xabar yuborish» ni yoqing.")
+    try:
+        um = await bot.get_chat_member(chat.id, message.from_user.id)
+    except Exception:
+        raise ValueError("Sizning huquqingizni tekshirib bo'lmadi.")
+    if um.status not in ("administrator", "creator"):
+        raise ValueError("Siz bu kanalda admin emassiz.")
+    return chat
+
+
+@dp.message(S.channel, not_menu)
+async def on_channel_input(message: types.Message, state: FSMContext):
+    try:
+        chat = await resolve_channel(message)
+    except ValueError as ex:
+        return await message.answer(f"❌ {e(ex)}")
+    with db() as c:
+        c.execute("INSERT OR REPLACE INTO channels (owner_id, chat_id, title, username) VALUES (?, ?, ?, ?)",
+                  (message.from_user.id, chat.id, chat.title or str(chat.id), getattr(chat, "username", None)))
+        c.commit()
+    await state.clear()
+    await message.answer(f"✅ <b>{e(chat.title)}</b> qo'shildi!", reply_markup=menu_kb())
+
+
+class _Wrap:
+    """show_channels uchun: javob callback xabariga, from_user — tugmani bosgan foydalanuvchi."""
+    def __init__(self, cb):
+        self._m, self.from_user = cb.message, cb.from_user
+
+    async def answer(self, *a, **k):
+        return await self._m.answer(*a, **k)
+
+
+@dp.callback_query(F.data.startswith("chdel:"))
+async def cb_chdel(callback: types.CallbackQuery):
+    await callback.answer("O'chirildi")
+    with db() as c:
+        c.execute("DELETE FROM channels WHERE id = ? AND owner_id = ?", (int(callback.data.split(":")[1]), callback.from_user.id))
+        c.commit()
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+    await show_channels(_Wrap(callback))
+
+
+# ---------------- Post yaratish ----------------
+@dp.message(S.content, not_menu)
+async def on_content(message: types.Message, state: FSMContext):
+    d = {"src_chat": message.chat.id, "src_msg": message.message_id, "rows": [], "reacts": [], "silent": False}
+    await state.update_data(draft=d)
+    await show_editor(message.chat.id, state)
+
+
+@dp.callback_query(F.data.startswith("ed:"))
+async def on_editor(callback: types.CallbackQuery, state: FSMContext):
+    action = callback.data.split(":", 1)[1]
+    chat_id = callback.message.chat.id
+    d = await get_draft(state)
+    if not d:
+        await callback.answer("Qoralama topilmadi. Qaytadan boshlang.", show_alert=True)
+        return
+    await callback.answer()
+    if action == "urls":
+        await state.set_state(S.urls)
+        return await callback.message.answer(
+            "🔗 Tugmalarni yuboring (har qator = bir qator):\n<code>Matn - https://t.me/kanal</code>\n"
+            "<code>Sayt - https://site.uz | Aloqa - @username</code>\n\nBekor qilish: /cancel")
+    if action == "reacts":
+        kb = [[btn(p, f"rx:{i}")] for i, p in enumerate(REACT_PRESETS)]
+        kb.append([btn("✍️ O'zim yozaman", "rx:custom"), btn("🚫 Olib tashlash", "rx:none")])
+        return await callback.message.answer("😀 Reaksiyalarni tanlang:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    if action == "clear":
+        d["rows"], d["reacts"] = [], []
+        await state.update_data(draft=d)
+        return await show_editor(chat_id, state, "🧹 Tugmalar tozalandi.")
+    if action == "silent":
+        d["silent"] = not d.get("silent")
+        await state.update_data(draft=d)
+        return await show_editor(chat_id, state)
+    if action == "cancel":
+        await safe_delete(chat_id, d.get("preview_id"))
+        await safe_delete(chat_id, d.get("panel_id"))
+        await state.clear()
+        return await callback.message.answer("✅ Bekor qilindi.", reply_markup=menu_kb())
+    if action in ("send", "sched"):
+        channels = get_channels(callback.from_user.id)
+        if not channels:
+            return await callback.message.answer("📢 Avval kanal qo'shing: «📢 Kanallarim».")
+        if action == "sched":
+            await state.set_state(S.when)
+            return await callback.message.answer(
+                "⏰ Yuborish vaqtini yozing:\n<code>18:30</code> · <code>ertaga 09:00</code> · <code>25.12 20:00</code> · <code>2026-12-25 20:00</code>\n\nBekor qilish: /cancel")
+        return await ask_channel(callback.message, channels, "pub")
+
+
+async def ask_channel(message, channels, prefix):
+    kb = [[btn(f"📢 {t[:40]}", f"{prefix}:{cid}")] for cid, _, t, _ in channels]
+    await message.answer("Qaysi kanalga?", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+
+@dp.callback_query(F.data.startswith("rx:"))
+async def on_react_pick(callback: types.CallbackQuery, state: FSMContext):
+    d = await get_draft(state)
+    if not d:
+        return await callback.answer("Qoralama topilmadi.", show_alert=True)
+    await callback.answer()
+    val = callback.data.split(":", 1)[1]
+    if val == "custom":
+        await state.set_state(S.reacts)
+        return await callback.message.answer("✍️ Emojilarni bo'sh joy bilan yuboring (eng ko'pi 6 ta). Masalan: <code>👍 ❤️ 🔥</code>")
+    d["reacts"] = [] if val == "none" else parse_reacts(REACT_PRESETS[int(val)])
+    await state.update_data(draft=d)
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+    await show_editor(callback.message.chat.id, state)
+
+
+@dp.message(S.reacts, text_not_menu)
+async def on_reacts_input(message: types.Message, state: FSMContext):
+    d = await get_draft(state)
+    reacts = parse_reacts(message.text)
+    if not reacts:
+        return await message.answer("❌ Emoji topilmadi. Masalan: <code>👍 ❤️ 🔥</code>")
+    d["reacts"] = reacts
+    await state.update_data(draft=d)
+    await show_editor(message.chat.id, state)
+
+
+@dp.message(S.urls, text_not_menu)
+async def on_urls_input(message: types.Message, state: FSMContext):
+    d = await get_draft(state)
+    rows, errors = parse_buttons(message.text)
+    if not rows:
+        return await message.answer("❌ Format noto'g'ri. Namuna:\n<code>Kanalga o'tish - https://t.me/kanal</code>")
+    d["rows"] = (d["rows"] + rows)[:20]
+    await state.update_data(draft=d)
+    note = f"⚠️ Tushunilmagan qismlar: {e('; '.join(errors)[:100])}" if errors else None
+    await show_editor(message.chat.id, state, note)
+
+
+@dp.message(S.when, text_not_menu)
+async def on_when_input(message: types.Message, state: FSMContext):
+    when = parse_when(message.text, local_now())
+    if not when:
+        return await message.answer("❌ Vaqt noto'g'ri yoki o'tib ketgan. Namuna: <code>18:30</code> yoki <code>25.12 20:00</code>")
+    d = await get_draft(state)
+    d["when"] = utc_str(when)
+    d["when_label"] = when.strftime("%d.%m.%Y %H:%M")
+    await state.update_data(draft=d)
+    await state.set_state(S.editor)
+    channels = get_channels(message.from_user.id)
+    if len(channels) == 1:
+        return await schedule_to(message, state, channels[0], message.from_user.id)
+    await ask_channel(message, channels, "sch")
+
+
+async def schedule_to(message, state, channel, owner_id):
+    d = await get_draft(state)
+    if not d or not d.get("when"):
+        return await message.answer("⚠️ Qoralama topilmadi.")
+    cid, chat_id, title, _ = channel
+    with db() as c:
+        c.execute("INSERT INTO scheduled (owner_id, chat_id, channel_title, src_chat, src_msg, rows_json, reacts_json, silent, run_at) "
+                  "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                  (owner_id, chat_id, title, d["src_chat"], d["src_msg"], json.dumps(d["rows"]), json.dumps(d["reacts"]), int(bool(d.get("silent"))), d["when"]))
+        c.commit()
+    label = d.get("when_label")
+    await state.clear()
+    await message.answer(f"⏰ Rejalashtirildi: <b>{e(title)}</b> — {label}", reply_markup=menu_kb())
+
+
+@dp.callback_query(F.data.startswith("sch:"))
+async def cb_schedule_channel(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    ch = get_channel(callback.from_user.id, int(callback.data.split(":")[1]))
+    if not ch:
+        return await callback.message.answer("⚠️ Kanal topilmadi.")
+    await schedule_to(callback.message, state, ch, callback.from_user.id)
+
+
+@dp.callback_query(F.data.startswith("pub:"))
+async def cb_publish(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    d = await get_draft(state)
+    ch = get_channel(callback.from_user.id, int(callback.data.split(":")[1]))
+    if not d or not ch:
+        return await callback.message.answer("⚠️ Qoralama yoki kanal topilmadi.")
+    try:
+        await publish_post(callback.from_user.id, ch[1], d["src_chat"], d["src_msg"], d["rows"], d["reacts"], d.get("silent"))
+    except Exception as ex:
+        logging.warning("publish xatosi: %s", ex)
+        return await callback.message.answer(f"❌ Yuborilmadi: {e(explain(ex))}")
+    await safe_delete(callback.message.chat.id, d.get("preview_id"))
+    await safe_delete(callback.message.chat.id, d.get("panel_id"))
+    await state.clear()
+    await callback.message.answer(f"✅ Post <b>{e(ch[2])}</b> kanaliga yuborildi!", reply_markup=menu_kb())
 
 
 @dp.callback_query(F.data == "noop")
 async def cb_noop(callback: types.CallbackQuery):
-    await callback.answer()
+    await callback.answer("Bu ko'rib chiqish rejimi")
 
 
-def episodes_kb(tid, eps, page=0):
-    pages = (len(eps) - 1) // EP_PAGE + 1
-    page = max(0, min(page, pages - 1))
-    chunk = eps[page * EP_PAGE:(page + 1) * EP_PAGE]
-    kb, row = [], []
-    for eid, no, _, _ in chunk:
-        row.append(btn(str(no), f"ep:{eid}"))
-        if len(row) == 5:
-            kb.append(row)
-            row = []
-    if row:
-        kb.append(row)
-    if pages > 1:
-        nav = []
-        if page > 0:
-            nav.append(btn("⬅️", f"tp:{tid}:{page - 1}"))
-        nav.append(btn(f"{page + 1}/{pages}", "noop"))
-        if page < pages - 1:
-            nav.append(btn("➡️", f"tp:{tid}:{page + 1}"))
-        kb.append(nav)
-    return InlineKeyboardMarkup(inline_keyboard=kb)
+# ---------------- Reaksiyalar (kanaldagi postda) ----------------
+def vote_counts(c, post_id, n):
+    counts = [0] * n
+    for idx, cnt in c.execute("SELECT idx, COUNT(*) FROM votes WHERE post_id = ? GROUP BY idx", (post_id,)):
+        if 0 <= idx < n:
+            counts[idx] = cnt
+    return counts
 
 
-async def show_title(chat_id, tid):
-    t = get_title(tid)
-    if not t:
-        return await bot.send_message(chat_id, "❌ Topilmadi. Ehtimol o'chirilgan.", reply_markup=menu_kb())
-    with db() as c:
-        c.execute("UPDATE titles SET views = views + 1 WHERE id = ?", (tid,))
-        c.commit()
-    eps = get_episodes(tid)
-    if not eps:
-        return await bot.send_message(chat_id, f"🎞 <b>{e(t[2])}</b>\n\nHozircha qismlar yo'q.")
-    if len(eps) == 1 and t[1] == "kino":
-        return await send_episode(chat_id, eps[0][0])
-    icon = "🎌" if t[1] == "anime" else "🎬"
-    desc = e(t[3])[:700] if t[3] else ""
-    caption = f"{icon} <b>{e(t[2])}</b>\n" + (f"\n{desc}\n" if desc else "") + f"\n📺 Qismlar: {len(eps)} ta\nQismni tanlang 👇"
-    kb = episodes_kb(tid, eps)
-    if t[4]:
-        try:
-            return await bot.send_photo(chat_id, t[4], caption=caption, reply_markup=kb)
-        except Exception as ex:
-            logging.warning("poster yuborilmadi: %s", ex)
-    await bot.send_message(chat_id, caption, reply_markup=kb)
-
-
-@dp.callback_query(F.data.startswith("t:"))
-async def cb_title(callback: types.CallbackQuery):
-    await callback.answer()
-    tid = to_int(callback.data.split(":")[1])
-    if not await gate(callback.message.chat.id, callback.from_user.id, f"t{tid}"):
-        return
-    await show_title(callback.message.chat.id, tid)
-
-
-@dp.callback_query(F.data.startswith("tp:"))
-async def cb_title_page(callback: types.CallbackQuery):
-    await callback.answer()
-    parts = callback.data.split(":")
-    if len(parts) != 3:
-        return
-    tid, page = to_int(parts[1]), to_int(parts[2])
-    eps = get_episodes(tid)
-    if eps:
-        try:
-            await callback.message.edit_reply_markup(reply_markup=episodes_kb(tid, eps, page))
-        except TelegramBadRequest:
-            pass
-
-
-async def send_episode(chat_id, eid):
-    ep = get_episode(eid)
-    if not ep:
-        return await bot.send_message(chat_id, "❌ Video topilmadi.")
-    _, tid, no, file_id, ftype = ep
-    t = get_title(tid)
-    eps = get_episodes(tid)
-    idx = next((i for i, x in enumerate(eps) if x[0] == eid), 0)
-    nav = []
-    if idx > 0:
-        nav.append(btn("⬅️ Oldingi", f"ep:{eps[idx - 1][0]}"))
-    if len(eps) > 1:
-        nav.append(btn("📋 Qismlar", f"t:{tid}"))
-    if idx < len(eps) - 1:
-        nav.append(btn("Keyingi ➡️", f"ep:{eps[idx + 1][0]}"))
-    name = t[2] if t else ""
-    caption = f"🎬 <b>{e(name)}</b>" + (f"\n{no}-qism" if len(eps) > 1 else "") + "\n\n🍿 Yoqimli tomosha!"
-    kb = InlineKeyboardMarkup(inline_keyboard=[nav]) if nav else None
+@dp.callback_query(F.data.startswith("r:"))
+async def cb_react(callback: types.CallbackQuery):
     try:
-        if ftype == "document":
-            await bot.send_document(chat_id, file_id, caption=caption, reply_markup=kb, protect_content=PROTECT)
+        _, pid, idx = callback.data.split(":")
+        pid, idx = int(pid), int(idx)
+    except ValueError:
+        return await callback.answer()
+    with db() as c:
+        row = c.execute("SELECT rows_json, reacts_json FROM posts WHERE id = ?", (pid,)).fetchone()
+        if not row:
+            return await callback.answer("Post topilmadi")
+        rows, reacts = json.loads(row[0]), json.loads(row[1])
+        if not (0 <= idx < len(reacts)):
+            return await callback.answer()
+        cur = c.execute("SELECT idx FROM votes WHERE post_id = ? AND user_id = ?", (pid, callback.from_user.id)).fetchone()
+        if cur and cur[0] == idx:
+            c.execute("DELETE FROM votes WHERE post_id = ? AND user_id = ?", (pid, callback.from_user.id))
+            toast = "Olib tashlandi"
         else:
-            await bot.send_video(chat_id, file_id, caption=caption, reply_markup=kb, protect_content=PROTECT,
-                                 supports_streaming=True)
-    except Exception as ex:
-        logging.warning("episode yuborilmadi: %s", ex)
-        await bot.send_message(chat_id, "❌ Videoni yuborib bo'lmadi (file_id yaroqsiz bo'lishi mumkin).")
-
-
-@dp.callback_query(F.data.startswith("ep:"))
-async def cb_episode(callback: types.CallbackQuery):
-    await callback.answer()
-    eid = to_int(callback.data.split(":")[1])
-    if not await gate(callback.message.chat.id, callback.from_user.id, f"e{eid}"):
-        return
-    await send_episode(callback.message.chat.id, eid)
-
-
-# ---------------- Admin ----------------
-class Add(StatesGroup):
-    name = State()
-    desc = State()
-    poster = State()
-    eps = State()
-
-
-class Bc(StatesGroup):
-    msg = State()
-
-
-def admin_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [btn("➕ Yangi qo'shish", "adm:add")],
-        [btn("📋 Ro'yxat / tahrirlash", "adm:list:0"), btn("📊 Statistika", "adm:stats")],
-        [btn("📢 Xabar yuborish", "adm:bc"), btn("💾 Backup", "adm:backup")],
-    ])
-
-
-@dp.message(Command("admin"))
-async def cmd_admin(message: types.Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return await message.answer(f"⛔ Siz admin emassiz. ID'ingiz: <code>{message.from_user.id}</code>\n"
-                                    "Render'da ADMIN_ID ga shu raqamni yozing.")
-    await state.clear()
-    await message.answer("🛠 <b>Admin panel</b>", reply_markup=admin_kb())
-
-
-async def admin_only(callback):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Ruxsat yo'q", show_alert=True)
-        return False
-    return True
-
-
-@dp.callback_query(F.data == "adm:add")
-async def adm_add(callback: types.CallbackQuery, state: FSMContext):
-    if not await admin_only(callback):
-        return
-    await callback.answer()
-    await state.clear()
-    kb = InlineKeyboardMarkup(inline_keyboard=[[btn("🎌 Anime", "cat:anime"), btn("🎬 Kino", "cat:kino")]])
-    await callback.message.answer("Turini tanlang:", reply_markup=kb)
-
-
-@dp.callback_query(F.data.startswith("cat:"))
-async def adm_cat(callback: types.CallbackQuery, state: FSMContext):
-    if not await admin_only(callback):
-        return
-    await callback.answer()
-    cat = callback.data.split(":")[1]
-    if cat not in ("anime", "kino"):
-        return
-    await state.update_data(category=cat)
-    await state.set_state(Add.name)
-    await callback.message.answer("✏️ Nomini yuboring:\n(Bekor qilish: /cancel)")
-
-
-@dp.message(Add.name, F.text)
-async def add_name(message: types.Message, state: FSMContext):
-    if message.text.startswith("/"):
-        return await message.answer("✏️ Nomni oddiy matn qilib yuboring (yoki /cancel).")
-    await state.update_data(name=message.text.strip()[:150])
-    await state.set_state(Add.desc)
-    await message.answer("📝 Qisqa tavsif yuboring (yoki /skip):")
-
-
-@dp.message(Add.desc, F.text)
-async def add_desc(message: types.Message, state: FSMContext):
-    desc = "" if message.text.strip() == "/skip" else message.text.strip()[:700]
-    await state.update_data(desc=desc)
-    await state.set_state(Add.poster)
-    await message.answer("🖼 Poster rasmini yuboring (yoki /skip):")
-
-
-async def create_title(message, state, poster):
-    data = await state.get_data()
-    if "category" not in data or "name" not in data:
-        await state.clear()
-        return await message.answer("⚠️ Ma'lumot yo'qolgan. /admin orqali qaytadan boshlang.")
-    with db() as c:
-        cur = c.execute("INSERT INTO titles (category, name, description, poster, created) VALUES (?, ?, ?, ?, ?)",
-                        (data["category"], data["name"], data.get("desc", ""), poster,
-                         datetime.now().strftime("%Y-%m-%d %H:%M")))
-        tid = cur.lastrowid
+            c.execute("INSERT OR REPLACE INTO votes (post_id, user_id, idx) VALUES (?, ?, ?)", (pid, callback.from_user.id, idx))
+            toast = reacts[idx]
         c.commit()
-    await state.update_data(title_id=tid)
-    await state.set_state(Add.eps)
-    await message.answer(
-        f"✅ <b>{e(data['name'])}</b> yaratildi.\n\n🎞 Endi videolarni <b>ketma-ket</b> yuboring (1-qism, 2-qism...).\n"
-        "Kino bo'lsa — bitta video. Tugagach: /done")
+        counts = vote_counts(c, pid, len(reacts))
+    await callback.answer(toast)
+    try:
+        await callback.message.edit_reply_markup(reply_markup=post_kb(rows, reacts, counts, pid))
+    except Exception:
+        pass
 
 
-@dp.message(Add.poster, F.photo)
-async def add_poster(message: types.Message, state: FSMContext):
-    await create_title(message, state, message.photo[-1].file_id)
-
-
-@dp.message(Add.poster, F.text)
-async def add_poster_skip(message: types.Message, state: FSMContext):
-    if message.text.strip() == "/skip":
-        return await create_title(message, state, "")
-    await message.answer("🖼 Rasm yuboring yoki /skip yozing.")
-
-
-@dp.message(Add.eps, Command("done"))
-async def add_done(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    tid = data.get("title_id")
-    await state.clear()
-    eps = get_episodes(tid) if tid else []
-    if not eps:
-        return await message.answer("⚠️ Hech qanday video yuborilmadi.", reply_markup=menu_kb())
-    link = f"https://t.me/{await bot_username()}?start=t{tid}"
-    rows = [[btn("📣 Kanalga yuborish", f"adm:post:{tid}")]] if POST_CHANNELS else []
-    await message.answer(f"✅ Tayyor! {len(eps)} ta qism saqlandi.\n\n🔗 Havola:\n<code>{link}</code>",
-                         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows) if rows else menu_kb())
-    if rows:
-        await message.answer("👇 Pastdagi menyu qaytarildi.", reply_markup=menu_kb())
-    run_bg(safe_push_backup())
-
-
-_ep_lock = asyncio.Lock()
-
-
-@dp.message(Add.eps, F.video | F.document | F.animation)
-async def add_episode_msg(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    tid = data.get("title_id")
-    if not tid or not get_title(tid):
-        return await message.answer("⚠️ Avval /admin orqali yangi qo'shing.")
-    if message.video:
-        fid, ftype = message.video.file_id, "video"
-    elif message.animation:
-        fid, ftype = message.animation.file_id, "video"
-    else:
-        fid, ftype = message.document.file_id, "document"
-    async with _ep_lock:
-        n = add_episode(tid, fid, ftype)
-    await message.answer(f"✅ {n}-qism saqlandi. Yana yuboring yoki /done")
-
-
-@dp.message(Add.eps)
-async def add_eps_hint(message: types.Message):
-    await message.answer("🎞 Video yuboring yoki tugatish uchun /done")
-
-
-@dp.callback_query(F.data.startswith("adm:list:"))
-async def adm_list(callback: types.CallbackQuery):
-    if not await admin_only(callback):
-        return
-    await callback.answer()
-    page = to_int(callback.data.split(":")[2])
+# ---------------- Rejalashtirilganlar va statistika ----------------
+async def show_scheduled(message):
     with db() as c:
-        rows = c.execute("SELECT t.id, t.name, t.category, (SELECT COUNT(*) FROM episodes e WHERE e.title_id = t.id) "
-                         "FROM titles t ORDER BY t.id DESC").fetchall()
+        rows = c.execute("SELECT id, channel_title, run_at FROM scheduled WHERE owner_id = ? ORDER BY run_at", (message.from_user.id,)).fetchall()
     if not rows:
-        return await callback.message.answer("Hali hech narsa qo'shilmagan.")
-    pages = (len(rows) - 1) // PAGE + 1
-    page = max(0, min(page, pages - 1))
-    kb = [[btn(f"{'🎌' if cat == 'anime' else '🎬'} {name[:30]} ({n})", f"adm:t:{tid}")]
-          for tid, name, cat, n in rows[page * PAGE:(page + 1) * PAGE]]
-    nav = []
-    if page > 0:
-        nav.append(btn("⬅️", f"adm:list:{page - 1}"))
-    nav.append(btn(f"{page + 1}/{pages}", "noop"))
-    if page < pages - 1:
-        nav.append(btn("➡️", f"adm:list:{page + 1}"))
-    kb.append(nav)
-    text, markup = f"📋 Ro'yxat ({len(rows)} ta):", InlineKeyboardMarkup(inline_keyboard=kb)
-    # Sahifa almashtirilganda yangi xabar emas, shu xabarni o'zgartiramiz
-    if callback.message.text and callback.message.text.startswith("📋 Ro'yxat"):
-        try:
-            return await callback.message.edit_text(text, reply_markup=markup)
-        except TelegramBadRequest:
-            return
-    await callback.message.answer(text, reply_markup=markup)
+        return await message.answer("⏰ Rejalashtirilgan postlar yo'q.")
+    lines, kb = ["⏰ <b>Rejalashtirilgan postlar:</b>"], []
+    for sid, title, run_at in rows:
+        dt = datetime.strptime(run_at, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc).astimezone(TZ)
+        lines.append(f"• {dt.strftime('%d.%m %H:%M')} — {e(title)}")
+        kb.append([btn(f"❌ {dt.strftime('%d.%m %H:%M')} {title[:20]}", f"schdel:{sid}")])
+    await message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
 
-@dp.callback_query(F.data.startswith("adm:t:"))
-async def adm_title(callback: types.CallbackQuery):
-    if not await admin_only(callback):
-        return
-    await callback.answer()
-    tid = to_int(callback.data.split(":")[2])
-    t = get_title(tid)
-    if not t:
-        return await callback.message.answer("Topilmadi.")
-    n = len(get_episodes(tid))
-    link = f"https://t.me/{await bot_username()}?start=t{tid}"
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [btn("➕ Qism qo'shish", f"adm:eps:{tid}"), btn("➖ Oxirgi qismni o'chirish", f"adm:dl:{tid}")],
-        [btn("👁 Ko'rish", f"t:{tid}"), btn("🗑 O'chirish", f"adm:del:{tid}")],
-    ] + ([[btn("📣 Kanalga yuborish", f"adm:post:{tid}")]] if POST_CHANNELS else []))
-    await callback.message.answer(f"<b>{e(t[2])}</b>\n📺 Qismlar: {n} · 👁 {t[5]}\n🔗 <code>{link}</code>", reply_markup=kb)
-
-
-@dp.callback_query(F.data.startswith("adm:post:"))
-async def adm_post_to_channels(callback: types.CallbackQuery):
-    """Anime/kino kartasini kanal(lar)ga 'Tomosha qilish' tugmasi bilan yuboradi."""
-    if not await admin_only(callback):
-        return
-    tid = to_int(callback.data.split(":")[2])
-    t = get_title(tid)
-    if not t:
-        return await callback.answer("Topilmadi", show_alert=True)
-    if not POST_CHANNELS:
-        return await callback.answer("Render'da POST_CHANNELS ni kiriting (masalan @kanal1,@kanal2)", show_alert=True)
-    await callback.answer("Yuborilmoqda...")
-    eps = get_episodes(tid)
-    icon = "🎌" if t[1] == "anime" else "🎬"
-    desc = e(t[3])[:600] if t[3] else ""
-    caption = (f"{icon} <b>{e(t[2])}</b>\n" + (f"\n{desc}\n" if desc else "")
-               + (f"\n📺 Qismlar: {len(eps)} ta" if len(eps) > 1 else "")
-               + f"\n\n▶️ Tomosha qilish: @{await bot_username()}")
-    kb = InlineKeyboardMarkup(inline_keyboard=[[btn("▶️ Tomosha qilish", url=f"https://t.me/{await bot_username()}?start=t{tid}")]])
-    ok, bad = [], []
-    for ch in POST_CHANNELS:
-        try:
-            if t[4]:
-                await bot.send_photo(ch, t[4], caption=caption, reply_markup=kb)
-            else:
-                await bot.send_message(ch, caption, reply_markup=kb)
-            ok.append(ch)
-        except Exception as ex:
-            logging.warning("kanalga yuborib bo'lmadi (%s): %s", ch, ex)
-            bad.append(f"{ch} — {type(ex).__name__}")
-    text = ""
-    if ok:
-        text += "✅ Yuborildi: " + ", ".join(ok)
-    if bad:
-        text += ("\n" if text else "") + "❌ Yuborilmadi (bot kanalda admin ekanini tekshiring):\n" + "\n".join(bad)
-    await callback.message.answer(text or "Hech narsa yuborilmadi.")
-
-
-@dp.callback_query(F.data.startswith("adm:eps:"))
-async def adm_more_eps(callback: types.CallbackQuery, state: FSMContext):
-    if not await admin_only(callback):
-        return
-    await callback.answer()
-    tid = to_int(callback.data.split(":")[2])
-    if not get_title(tid):
-        return await callback.message.answer("Topilmadi.")
-    await state.clear()
-    await state.update_data(title_id=tid)
-    await state.set_state(Add.eps)
-    await callback.message.answer("🎞 Qo'shiladigan videolarni yuboring. Tugagach: /done")
-
-
-@dp.callback_query(F.data.startswith("adm:dl:"))
-async def adm_del_last(callback: types.CallbackQuery):
-    if not await admin_only(callback):
-        return
-    tid = to_int(callback.data.split(":")[2])
-    with db() as c:
-        row = c.execute("SELECT id, ep_no FROM episodes WHERE title_id = ? ORDER BY ep_no DESC, id DESC LIMIT 1",
-                        (tid,)).fetchone()
-        if row:
-            c.execute("DELETE FROM episodes WHERE id = ?", (row[0],))
-            c.commit()
-    if not row:
-        return await callback.answer("Qismlar yo'q", show_alert=True)
-    await callback.answer(f"{row[1]}-qism o'chirildi", show_alert=True)
-    run_bg(safe_push_backup())
-
-
-@dp.callback_query(F.data.startswith("adm:del:"))
-async def adm_del(callback: types.CallbackQuery):
-    if not await admin_only(callback):
-        return
-    await callback.answer()
-    tid = to_int(callback.data.split(":")[2])
-    kb = InlineKeyboardMarkup(inline_keyboard=[[btn("✅ Ha, o'chir", f"adm:delok:{tid}"), btn("↩️ Yo'q", "adm:cancel")]])
-    await callback.message.answer("⚠️ Rostdan ham o'chirilsinmi? (barcha qismlari bilan)", reply_markup=kb)
-
-
-@dp.callback_query(F.data == "adm:cancel")
-async def adm_cancel_cb(callback: types.CallbackQuery):
+@dp.callback_query(F.data.startswith("schdel:"))
+async def cb_schdel(callback: types.CallbackQuery):
     await callback.answer("Bekor qilindi")
+    with db() as c:
+        c.execute("DELETE FROM scheduled WHERE id = ? AND owner_id = ?", (int(callback.data.split(":")[1]), callback.from_user.id))
+        c.commit()
     try:
         await callback.message.delete()
     except Exception:
         pass
 
 
-@dp.callback_query(F.data.startswith("adm:delok:"))
-async def adm_delok(callback: types.CallbackQuery):
-    if not await admin_only(callback):
-        return
-    await callback.answer("O'chirildi")
-    tid = to_int(callback.data.split(":")[2])
+async def show_stats(message):
+    uid = message.from_user.id
+    channels = get_channels(uid)
     with db() as c:
-        c.execute("DELETE FROM episodes WHERE title_id = ?", (tid,))
-        c.execute("DELETE FROM titles WHERE id = ?", (tid,))
-        c.commit()
-    try:
-        await callback.message.edit_text("🗑 O'chirildi.")
-    except Exception:
-        pass
-    run_bg(safe_push_backup())
+        posts = c.execute("SELECT COUNT(*) FROM posts WHERE owner_id = ? AND message_id IS NOT NULL", (uid,)).fetchone()[0]
+        pending = c.execute("SELECT COUNT(*) FROM scheduled WHERE owner_id = ?", (uid,)).fetchone()[0]
+        votes = c.execute("SELECT COUNT(*) FROM votes WHERE post_id IN (SELECT id FROM posts WHERE owner_id = ?)", (uid,)).fetchone()[0]
+    lines = ["📊 <b>Statistika</b>\n", f"📢 Kanallar: {len(channels)}", f"📝 Yuborilgan postlar: {posts}", f"⏰ Rejalashtirilgan: {pending}", f"👍 Jami reaksiyalar: {votes}"]
+    for _, chat_id, title, _ in channels:
+        try:
+            n = await bot.get_chat_member_count(chat_id)
+            lines.append(f"• {e(title)} — 👥 {n:,}".replace(",", " "))
+        except Exception:
+            lines.append(f"• {e(title)} — 👥 ?")
+    await message.answer("\n".join(lines))
 
 
-@dp.callback_query(F.data == "adm:stats")
-async def adm_stats(callback: types.CallbackQuery):
-    if not await admin_only(callback):
-        return
-    await callback.answer()
-    with db() as c:
-        users = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        titles = c.execute("SELECT COUNT(*) FROM titles").fetchone()[0]
-        eps = c.execute("SELECT COUNT(*) FROM episodes").fetchone()[0]
-        views = c.execute("SELECT COALESCE(SUM(views), 0) FROM titles").fetchone()[0]
-        top = c.execute("SELECT name, views FROM titles ORDER BY views DESC LIMIT 5").fetchall()
-    lines = ["📊 <b>Statistika</b>\n", f"👥 Foydalanuvchilar: {users}", f"🎞 Nomlar: {titles}",
-             f"📺 Qismlar: {eps}", f"👁 Ko'rishlar: {views}"]
-    if top:
-        lines.append("\n🔥 Top 5:")
-        lines += [f"{i}. {e(n)} — {v}" for i, (n, v) in enumerate(top, 1)]
-    await callback.message.answer("\n".join(lines))
+async def scheduled_worker():
+    while True:
+        try:
+            with db() as c:
+                due = c.execute(
+                    "SELECT id, owner_id, chat_id, channel_title, src_chat, src_msg, rows_json, reacts_json, silent FROM scheduled "
+                    "WHERE run_at <= ? ORDER BY run_at LIMIT 20", (utc_str(datetime.now(timezone.utc)),)).fetchall()
+            for sid, owner, chat_id, title, src_chat, src_msg, rj, rcj, silent in due:
+                with db() as c:
+                    c.execute("DELETE FROM scheduled WHERE id = ?", (sid,))
+                    c.commit()
+                try:
+                    await publish_post(owner, chat_id, src_chat, src_msg, json.loads(rj), json.loads(rcj), silent)
+                    msg = f"✅ Rejalashtirilgan post <b>{e(title)}</b> kanaliga yuborildi."
+                except Exception as ex:
+                    logging.warning("scheduled xatosi: %s", ex)
+                    msg = f"❌ Rejalashtirilgan post <b>{e(title)}</b> kanaliga yuborilmadi: {e(explain(ex))}"
+                try:
+                    await bot.send_message(owner, msg)
+                except Exception:
+                    pass
+        except Exception:
+            logging.exception("scheduled_worker")
+        await asyncio.sleep(15)
 
 
-@dp.callback_query(F.data == "adm:bc")
-async def adm_bc(callback: types.CallbackQuery, state: FSMContext):
-    if not await admin_only(callback):
-        return
-    await callback.answer()
-    await state.set_state(Bc.msg)
-    await callback.message.answer("📢 Barcha foydalanuvchilarga yuboriladigan xabarni yuboring (matn, rasm, video...).\n"
-                                  "Bekor qilish: /cancel")
-
-
-async def do_broadcast(from_chat, msg_id, status):
-    with db() as c:
-        ids = [r[0] for r in c.execute("SELECT user_id FROM users")]
-    ok = bad = 0
-    for i, uid in enumerate(ids, 1):
-        for _ in range(3):
-            try:
-                await bot.copy_message(uid, from_chat, msg_id)
-                ok += 1
-                break
-            except TelegramRetryAfter as ex:
-                await asyncio.sleep(ex.retry_after + 1)
-            except Exception:
-                bad += 1
-                break
-        await asyncio.sleep(0.05)
-        if i % 200 == 0:
-            try:
-                await status.edit_text(f"⏳ Yuborilmoqda... {i}/{len(ids)}")
-            except Exception:
-                pass
-    try:
-        await status.edit_text(f"✅ Yuborildi: {ok}\n❌ Yetmadi (bloklagan): {bad}")
-    except Exception:
-        await bot.send_message(from_chat, f"✅ Yuborildi: {ok}\n❌ Yetmadi (bloklagan): {bad}")
-
-
-@dp.message(Bc.msg)
-async def bc_send(message: types.Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    if message.text and message.text.startswith("/"):
-        return await message.answer("Xabarni yuboring yoki /cancel")
-    await state.clear()
-    with db() as c:
-        total = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-    status = await message.answer(f"⏳ Yuborilmoqda... ({total} ta)")
-    # Uzoq davom etadigan ishni fonda bajaramiz — bot boshqa foydalanuvchilarga javob berishda davom etadi
-    run_bg(do_broadcast(message.chat.id, message.message_id, status))
-
-
-# ---------------- Zaxira nusxa ----------------
+# ---------------- Zaxira nusxa (admin) ----------------
 restore_wait = set()
 
 
 def make_backup_file():
-    fd, path = tempfile.mkstemp(prefix="anime_backup_", suffix=".db")
-    os.close(fd)
+    path = os.path.join(tempfile.gettempdir(), "controller_backup.db")
     with db() as src, closing(sqlite3.connect(path)) as dst:
         src.backup(dst)
     return path
@@ -898,11 +834,9 @@ def restore_db_file(path):
     try:
         with closing(sqlite3.connect(path)) as c:
             names = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-            if c.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
-                return False
     except sqlite3.Error:
         return False
-    if not {"titles", "episodes"} <= names:
+    if not {"channels", "posts"} <= names:
         return False
     shutil.copyfile(path, DB_PATH + ".new")
     os.replace(DB_PATH + ".new", DB_PATH)
@@ -910,85 +844,62 @@ def restore_db_file(path):
     return True
 
 
-async def send_backup(chat_id, caption):
-    path = await asyncio.to_thread(make_backup_file)
-    try:
-        await bot.send_document(chat_id, FSInputFile(path, filename=f"anime_{datetime.now():%Y%m%d_%H%M}.db"), caption=caption)
-    finally:
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-
-
-@dp.callback_query(F.data == "adm:backup")
-async def adm_backup(callback: types.CallbackQuery):
-    if not await admin_only(callback):
-        return
-    await callback.answer()
-    await send_backup(callback.message.chat.id, "💾 Baza nusxasi. Tiklash: /restore")
-
-
-@dp.message(Command("backup"))
-async def cmd_backup(message: types.Message):
-    if is_admin(message.from_user.id):
-        await send_backup(message.chat.id, "💾 Baza nusxasi. Tiklash: /restore")
-
-
-@dp.message(Command("restore"))
-async def cmd_restore(message: types.Message, state: FSMContext):
-    if is_admin(message.from_user.id):
-        await state.clear()
-        restore_wait.add(message.from_user.id)
-        await message.answer("📥 Endi avval olingan .db faylni yuboring. ⚠️ Hozirgi baza almashtiriladi!\nBekor qilish: /cancel")
-
-
-@dp.message(StateFilter(None), F.document)
-async def on_restore_document(message: types.Message):
-    uid = message.from_user.id
-    if uid not in restore_wait or not is_admin(uid):
-        return
-    restore_wait.discard(uid)
-    fd, tmp = tempfile.mkstemp(prefix=f"restore_{uid}_", suffix=".db")
-    os.close(fd)
-    try:
-        await bot.download(message.document.file_id, destination=tmp)
-        ok = await asyncio.to_thread(restore_db_file, tmp)
-    finally:
-        if os.path.exists(tmp):
-            os.remove(tmp)
-    await message.answer("✅ Baza tiklandi!" if ok else "❌ Bu fayl mos emas (titles/episodes jadvallari yo'q yoki fayl buzilgan).")
-    if ok:
-        run_bg(safe_push_backup(force=True))
-
-
 def _admin_chat_id():
     return sorted(ADMIN_IDS)[0] if ADMIN_IDS else None
 
 
+@dp.message(Command("backup"))
+async def cmd_backup(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    path = make_backup_file()
+    try:
+        await message.answer_document(FSInputFile(path), caption="💾 Baza nusxasi")
+    finally:
+        os.remove(path)
+
+
+@dp.message(Command("restore"))
+async def cmd_restore(message: types.Message, state: FSMContext):
+    if message.from_user.id in ADMIN_IDS:
+        await state.clear()
+        restore_wait.add(message.from_user.id)
+        await message.answer("📥 Endi .db faylni yuboring.")
+
+
+@dp.message(F.document)
+async def on_document(message: types.Message):
+    uid = message.from_user.id
+    if uid in restore_wait and uid in ADMIN_IDS:
+        restore_wait.discard(uid)
+        tmp = os.path.join(tempfile.gettempdir(), f"restore_{uid}.db")
+        try:
+            await bot.download(message.document.file_id, destination=tmp)
+            ok = restore_db_file(tmp)
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        await message.answer("✅ Baza tiklandi!" if ok else "❌ Bu fayl mos emas.")
+
+
 # ===================== AVTOMATIK ZAXIRA VA TIKLASH (qadalgan xabar orqali) =====================
-BACKUP_NAME = "anime_backup.db"
+BACKUP_NAME = "controller_backup.db"
 _backup_state = {"hash": None}
+RESTORE_DONE = asyncio.Event()
 _restore_ran = [False]
-RESTORE_DONE = None      # asyncio.Event — main() ichida yaratiladi (to'g'ri event loop'ga bog'lanishi uchun)
-_backup_lock = None      # asyncio.Lock — main() ichida yaratiladi
 
 
 def db_fingerprint():
-    # views (ko'rishlar) har safar o'zgaradi — shuning uchun faqat kontent va foydalanuvchilar soni hisoblanadi
     h = hashlib.sha1()
     with db() as c:
-        for row in c.execute("SELECT id, category, name, description, poster FROM titles ORDER BY id"):
-            h.update(repr(row).encode("utf-8", "ignore"))
-        for row in c.execute("SELECT id, title_id, ep_no, file_id, ftype FROM episodes ORDER BY id"):
-            h.update(repr(row).encode("utf-8", "ignore"))
-        h.update(str(c.execute("SELECT COUNT(*) FROM users").fetchone()[0]).encode())
+        for line in c.iterdump():
+            h.update(line.encode("utf-8", "ignore"))
     return h.hexdigest()
 
 
 def db_has_data():
     with db() as c:
-        return bool(c.execute("SELECT (SELECT COUNT(*) FROM titles)+(SELECT COUNT(*) FROM episodes)").fetchone()[0])
+        return bool(c.execute("SELECT (SELECT COUNT(*) FROM channels)+(SELECT COUNT(*) FROM scheduled)+(SELECT COUNT(*) FROM posts)").fetchone()[0])
 
 
 async def _pinned_backup(chat_id):
@@ -1008,50 +919,35 @@ async def _pinned_backup(chat_id):
 
 async def push_backup(chat_id, force=False):
     """Baza o'zgargan bo'lsa, zaxirani admin chatidagi bitta qadalgan xabarda yangilaydi."""
-    async with _backup_lock:
-        fp = await asyncio.to_thread(db_fingerprint)
-        if not force and fp == _backup_state["hash"]:
-            return False
-        path = await asyncio.to_thread(make_backup_file)
-        try:
-            caption = "💾 Avtomatik zaxira (yangilanib turadi) · " + time.strftime("%d.%m %H:%M", time.gmtime()) + " UTC"
-            pm = await _pinned_backup(chat_id)
-            done = False
-            if pm:
-                try:
-                    await bot.edit_message_media(
-                        chat_id=chat_id, message_id=pm.message_id,
-                        media=InputMediaDocument(media=FSInputFile(path, filename=BACKUP_NAME), caption=caption))
-                    done = True
-                except Exception as ex:
-                    logging.info("zaxirani joyida yangilab bo'lmadi: %s", ex)
-            if not done:
-                m = await bot.send_document(chat_id, FSInputFile(path, filename=BACKUP_NAME), caption=caption,
-                                            disable_notification=True)
-                try:
-                    await bot.pin_chat_message(chat_id, m.message_id, disable_notification=True)
-                except Exception as ex:
-                    logging.warning("zaxirani qadab bo'lmadi: %s", ex)
-            _backup_state["hash"] = fp
-            return True
-        finally:
-            try:
-                os.remove(path)
-            except OSError:
-                pass
-
-
-async def safe_push_backup(force=False):
-    """O'zgarishdan keyin darhol zaxira (xato bo'lsa jim o'tadi)."""
-    if RESTORE_DONE is None or not RESTORE_DONE.is_set():
-        return
-    chat_id = _admin_chat_id()
-    if not chat_id:
-        return
+    fp = await asyncio.to_thread(db_fingerprint)
+    if not force and fp == _backup_state["hash"]:
+        return False
+    path = await asyncio.to_thread(make_backup_file)
     try:
-        await push_backup(chat_id, force=force)
-    except Exception as ex:
-        logging.warning("zaxira xatosi: %s", ex)
+        caption = "💾 Avtomatik zaxira (yangilanib turadi) · " + time.strftime("%d.%m %H:%M", time.gmtime()) + " UTC"
+        pm = await _pinned_backup(chat_id)
+        done = False
+        if pm:
+            try:
+                await bot.edit_message_media(
+                    chat_id=chat_id, message_id=pm.message_id,
+                    media=InputMediaDocument(media=FSInputFile(path, filename=BACKUP_NAME), caption=caption))
+                done = True
+            except Exception as ex:
+                logging.info("zaxirani joyida yangilab bo'lmadi: %s", ex)
+        if not done:
+            m = await bot.send_document(chat_id, FSInputFile(path, filename=BACKUP_NAME), caption=caption, disable_notification=True)
+            try:
+                await bot.pin_chat_message(chat_id, m.message_id, disable_notification=True)
+            except Exception as ex:
+                logging.warning("zaxirani qadab bo'lmadi: %s", ex)
+        _backup_state["hash"] = fp
+        return True
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
 async def startup_restore():
@@ -1068,8 +964,7 @@ async def startup_restore():
         if not pm:
             logging.info("qadalgan zaxira yo'q: bo'sh baza bilan boshlanadi")
             return
-        fd, tmp = tempfile.mkstemp(prefix="auto_restore_", suffix=".db")
-        os.close(fd)
+        tmp = os.path.join(tempfile.gettempdir(), "auto_restore.db")
         try:
             await bot.download(pm.document.file_id, destination=tmp)
             ok = await asyncio.to_thread(restore_db_file, tmp)
@@ -1111,61 +1006,20 @@ async def backup_worker():
         await asyncio.sleep(max(BACKUP_MINUTES, 1) * 60)
 
 
-# ---------------- Qidiruv (eng oxirida) ----------------
-@dp.message(StateFilter(None), F.text, ~F.text.startswith("/"))
-async def handle_search(message: types.Message):
-    add_user(message.from_user)
-    if not await gate(message.chat.id, message.from_user.id):
-        return
-    q = message.text.strip().lower()
-    if len(q) < 2:
-        return await message.answer("🔎 Kamida 2 ta harf yozing.")
-    # Raqam yozilsa (masalan, kanalda e'lon qilingan kod) — to'g'ridan-to'g'ri ochamiz
-    if q.isdigit() and get_title(int(q)):
-        return await show_title(message.chat.id, int(q))
-    with db() as c:
-        rows = c.execute("SELECT id, name, category FROM titles ORDER BY views DESC").fetchall()
-    norm = lambda s: re.sub(r"[ʻʼ'`‘’]", "", s.lower())
-    nq = norm(q)
-    found = [(tid, name, cat) for tid, name, cat in rows if nq in norm(name)][:20]
-    if not found:
-        return await message.answer("😕 Hech narsa topilmadi. Boshqa nom bilan urinib ko'ring.")
-    kb = [[btn(f"{'🎌' if cat == 'anime' else '🎬'} {name[:40]}", f"t:{tid}")] for tid, name, cat in found]
-    await message.answer(f"🔎 Topildi: {len(found)} ta", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
-
-
-@dp.message(StateFilter(None), F.text.startswith("/"))
-async def unknown_command(message: types.Message):
-    await message.answer("❓ Noma'lum buyruq. /start ni bosing.", reply_markup=menu_kb())
-
-
 async def main():
-    global RESTORE_DONE, _backup_lock
-    RESTORE_DONE = asyncio.Event()
-    _backup_lock = asyncio.Lock()
-    threading.Thread(target=self_ping, daemon=True).start()
-    await start_web_server()
-    run_bg(backup_worker())
+    asyncio.create_task(start_web_server())
+    asyncio.create_task(scheduled_worker())
+    asyncio.create_task(backup_worker())
     while True:
         try:
             await wait_for_valid_token()
             await startup_restore_once()
-            logging.info("Bot polling boshlandi...")
+            print("Bot polling boshlandi...")
             await bot.delete_webhook(drop_pending_updates=True)
             await dp.start_polling(bot, drop_pending_updates=True)
-            # start_polling faqat to'xtatish signali (Render qayta deploy) kelganda qaytadi.
-            # Shu yerda chiqib ketamiz — aks holda eski nusxa ishlashda davom etib, yangisi bilan Conflict beradi.
-            logging.info("Polling to'xtatildi, bot o'chmoqda.")
-            break
         except Exception as ex:
-            logging.error("Polling xatoligi: %s", ex)
+            logging.error(f"Polling xatoligi: {ex}")
             await asyncio.sleep(5)
-    try:
-        if _admin_chat_id():
-            await asyncio.wait_for(push_backup(_admin_chat_id()), timeout=8)
-    except Exception:
-        pass
-    await bot.session.close()
 
 
 if __name__ == "__main__":
